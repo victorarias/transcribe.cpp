@@ -62,15 +62,17 @@ struct ParakeetHParams;
 // W_ih + W_hh bias pre-summed at conversion time.
 
 struct HostLstmLayer {
-    // Host fp32 mirrors — LOAD-TIME SCRATCH ONLY: filled at load,
-    // uploaded into the resident ggml tensors below, then freed.
-    std::vector<float> Wx;  // [4*pred_hidden, pred_hidden] (freed after load)
-    std::vector<float> Wh;  // [4*pred_hidden, pred_hidden] (freed after load)
-    std::vector<float> b;   // [4*pred_hidden]              (freed after load)
+    // Model weight tensors, copied at load in their stored type (Q8_0 in
+    // the published GGUFs) so each per-step GEMV streams the quantized
+    // bytes instead of a 4x larger fp32 expansion. Borrowed from the model.
+    const ggml_tensor * src_Wx = nullptr;  // ne [pred_hidden, 4*pred_hidden]
+    const ggml_tensor * src_Wh = nullptr;  // ne [pred_hidden, 4*pred_hidden]
+    // Host fp32 bias — LOAD-TIME SCRATCH ONLY: uploaded below, then freed.
+    std::vector<float> b;  // [4*pred_hidden] (freed after load)
 
-    // Resident fp32 ggml mirrors consumed by the predictor graph.
-    // Row-major [4*H, H] host bytes map to ggml ne [H, 4*H] (the mul_mat
-    // operand); bias is [4*H]. Borrowed into lstm_w_ctx, freed by dtor.
+    // Resident ggml tensors consumed by the predictor graph: Wx/Wh keep
+    // the model tensor's type, bias is fp32 [4*H]. Borrowed into
+    // lstm_w_ctx, freed by dtor.
     ggml_tensor * g_Wx = nullptr;
     ggml_tensor * g_Wh = nullptr;
     ggml_tensor * g_b  = nullptr;
@@ -83,11 +85,12 @@ struct HostPredictor {
     std::vector<HostLstmLayer> lstm;             // pred_n_layers entries
 
     // --- resident ggml LSTM weights (immutable, model-owned) ---
-    // fp32 mirror of the per-layer Wx/Wh/b, made resident once at load so
-    // the per-decode PredGraph reads them without re-uploading. fp32: the
-    // per-step LSTM matmuls are n=1 GEMV (tinyBLAS skips n<2), so fp32 is
-    // closest to the host reference at no speed cost. Owned here, freed by
-    // dtor. On build failure lstm_ready stays false (hard decode error).
+    // Copy of the per-layer Wx/Wh/b, made resident once at load so the
+    // per-decode PredGraph reads them without re-uploading. Wx/Wh keep the
+    // model's stored type: the per-step GEMVs are memory-bound, and two
+    // fp32 layers (26 MB at H=640) overflow the CPU's L2 on every step.
+    // Owned here, freed by dtor. On build failure lstm_ready stays false
+    // (hard decode error).
     ggml_context *        lstm_w_ctx     = nullptr;
     ggml_backend_t        lstm_w_backend = nullptr;  // alloc-only; never compute'd
     ggml_backend_buffer_t lstm_w_buf     = nullptr;
@@ -109,17 +112,18 @@ struct HostJoint {
     std::string activation;       // "relu" / "sigmoid" / "tanh"
 
     // Host fp32 weight mirrors — LOAD-TIME SCRATCH ONLY: filled at load,
-    // uploaded into the resident ggml tensors below, then freed. (out_w is
-    // not mirrored — gw_w is built straight from the model tensor.)
+    // uploaded into the resident ggml tensors below, then freed. (pred_w
+    // and out_w are not mirrored — g_pred_w and gw_w copy the model
+    // tensors in their stored type, since both run once per decode step.)
     std::vector<float> enc_w;   // [joint_h, d_enc]       (freed after load)
     std::vector<float> enc_b;   // [joint_h]              (freed after load)
-    std::vector<float> pred_w;  // [joint_h, pred_hidden] (freed after load)
+    const ggml_tensor * src_pred_w = nullptr;  // ne [pred_hidden, joint_h], borrowed from the model
     std::vector<float> pred_b;  // [joint_h]              (freed after load)
     std::vector<float> out_b;   // [joint_n]              (freed after load)
 
     // --- resident ggml weights (immutable, model-owned) ---
     // The whole joint runs as one ggml graph (build_joint_graph), so
-    // every weight is resident fp32: enc projection (g_enc_w/g_enc_b),
+    // every weight is resident: enc projection (g_enc_w/g_enc_b, fp32),
     // pred projection (g_pred_w/g_pred_b), out projection (gw_w/gw_b).
     // Built once at load, only read after — safe to share across every
     // context; the mutable per-decode state lives in a stack-local
@@ -129,9 +133,9 @@ struct HostJoint {
     ggml_backend_buffer_t w_buf     = nullptr;
     ggml_tensor *         g_enc_w   = nullptr;  // [d_enc, joint_h] fp32 weight
     ggml_tensor *         g_enc_b   = nullptr;  // [joint_h] fp32 bias
-    ggml_tensor *         g_pred_w  = nullptr;  // [pred_hidden, joint_h] fp32 weight
+    ggml_tensor *         g_pred_w  = nullptr;  // [pred_hidden, joint_h] model-typed weight
     ggml_tensor *         g_pred_b  = nullptr;  // [joint_h] fp32 bias
-    ggml_tensor *         gw_w      = nullptr;  // [joint_h, joint_n] fp32 weight
+    ggml_tensor *         gw_w      = nullptr;  // [joint_h, joint_n] model-typed weight
     ggml_tensor *         gw_b      = nullptr;  // [joint_n] fp32 bias
     bool                  w_ready   = false;
 

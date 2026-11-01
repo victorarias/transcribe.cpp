@@ -111,11 +111,24 @@ bool read_tensor_to_f32(const ggml_tensor * t, std::vector<float> & out) {
     return true;
 }
 
-// Make the joint network's weights resident as fp32 ggml tensors on the
-// model: enc / pred / out projections. Built once at load. out_w is
-// dequantized from the model tensor src_out_w; the rest come from the
-// host mirrors, freed here once uploaded. On failure frees partial state
-// and returns false (w_ready stays false → hard decode error).
+// A resident CPU copy of a model weight tensor in its stored type, for the
+// per-step decoder GEMVs (ggml's CPU mul_mat takes any weight type).
+ggml_tensor * new_weight_like(ggml_context * ctx, const ggml_tensor * src) {
+    return ggml_new_tensor_2d(ctx, src->type, src->ne[0], src->ne[1]);
+}
+
+void copy_weight(const ggml_tensor * src, ggml_tensor * dst) {
+    std::vector<uint8_t> raw(ggml_nbytes(src));
+    ggml_backend_tensor_get(src, raw.data(), 0, raw.size());
+    ggml_backend_tensor_set(dst, raw.data(), 0, raw.size());
+}
+
+// Make the joint network's weights resident as ggml tensors on the model:
+// enc / pred / out projections. Built once at load. pred_w and out_w are
+// copied from the model tensors in their stored type; enc_w (used once per
+// decode, in one sgemm) and the biases come from the host fp32 mirrors,
+// freed here once uploaded. On failure frees partial state and returns
+// false (w_ready stays false → hard decode error).
 bool build_joint_weight(HostJoint & j, const ggml_tensor * src_out_w) {
     const int joint_h = j.joint_h;
     const int joint_n = j.joint_n;
@@ -162,9 +175,9 @@ bool build_joint_weight(HostJoint & j, const ggml_tensor * src_out_w) {
 
     j.g_enc_w  = ggml_new_tensor_2d(j.w_ctx, GGML_TYPE_F32, j.d_enc, joint_h);
     j.g_enc_b  = ggml_new_tensor_1d(j.w_ctx, GGML_TYPE_F32, joint_h);
-    j.g_pred_w = ggml_new_tensor_2d(j.w_ctx, GGML_TYPE_F32, j.pred_hidden, joint_h);
+    j.g_pred_w = new_weight_like(j.w_ctx, j.src_pred_w);
     j.g_pred_b = ggml_new_tensor_1d(j.w_ctx, GGML_TYPE_F32, joint_h);
-    j.gw_w     = ggml_new_tensor_2d(j.w_ctx, GGML_TYPE_F32, joint_h, joint_n);
+    j.gw_w     = new_weight_like(j.w_ctx, src_out_w);
     j.gw_b     = ggml_new_tensor_1d(j.w_ctx, GGML_TYPE_F32, joint_n);
 
     j.w_buf = ggml_backend_alloc_ctx_tensors(j.w_ctx, j.w_backend);
@@ -172,25 +185,17 @@ bool build_joint_weight(HostJoint & j, const ggml_tensor * src_out_w) {
         return fail();
     }
 
-    // out_w: dequantize the model tensor to fp32 once.
-    {
-        std::vector<float> tmp;
-        if (!read_tensor_to_f32(src_out_w, tmp)) {
-            return fail();
-        }
-        ggml_backend_tensor_set(j.gw_w, tmp.data(), 0, tmp.size() * sizeof(float));
-    }
+    copy_weight(src_out_w, j.gw_w);
+    copy_weight(j.src_pred_w, j.g_pred_w);
     // The rest come from the host mirrors.
     ggml_backend_tensor_set(j.g_enc_w, j.enc_w.data(), 0, j.enc_w.size() * sizeof(float));
     ggml_backend_tensor_set(j.g_enc_b, j.enc_b.data(), 0, j.enc_b.size() * sizeof(float));
-    ggml_backend_tensor_set(j.g_pred_w, j.pred_w.data(), 0, j.pred_w.size() * sizeof(float));
     ggml_backend_tensor_set(j.g_pred_b, j.pred_b.data(), 0, j.pred_b.size() * sizeof(float));
     ggml_backend_tensor_set(j.gw_b, j.out_b.data(), 0, j.out_b.size() * sizeof(float));
 
     // Host mirrors are now resident in ggml — release them (load-time scratch).
     std::vector<float>().swap(j.enc_w);
     std::vector<float>().swap(j.enc_b);
-    std::vector<float>().swap(j.pred_w);
     std::vector<float>().swap(j.pred_b);
     std::vector<float>().swap(j.out_b);
 
@@ -251,8 +256,8 @@ bool build_pred_weights(HostPredictor & p) {
 
     for (int l = 0; l < L; ++l) {
         auto & lh = p.lstm[l];
-        lh.g_Wx   = ggml_new_tensor_2d(p.lstm_w_ctx, GGML_TYPE_F32, H, four_H);
-        lh.g_Wh   = ggml_new_tensor_2d(p.lstm_w_ctx, GGML_TYPE_F32, H, four_H);
+        lh.g_Wx   = new_weight_like(p.lstm_w_ctx, lh.src_Wx);
+        lh.g_Wh   = new_weight_like(p.lstm_w_ctx, lh.src_Wh);
         lh.g_b    = ggml_new_tensor_1d(p.lstm_w_ctx, GGML_TYPE_F32, four_H);
     }
 
@@ -263,12 +268,10 @@ bool build_pred_weights(HostPredictor & p) {
 
     for (int l = 0; l < L; ++l) {
         auto & lh = p.lstm[l];
-        ggml_backend_tensor_set(lh.g_Wx, lh.Wx.data(), 0, lh.Wx.size() * sizeof(float));
-        ggml_backend_tensor_set(lh.g_Wh, lh.Wh.data(), 0, lh.Wh.size() * sizeof(float));
+        copy_weight(lh.src_Wx, lh.g_Wx);
+        copy_weight(lh.src_Wh, lh.g_Wh);
         ggml_backend_tensor_set(lh.g_b, lh.b.data(), 0, lh.b.size() * sizeof(float));
         // Host mirrors now resident in ggml — release them.
-        std::vector<float>().swap(lh.Wx);
-        std::vector<float>().swap(lh.Wh);
         std::vector<float>().swap(lh.b);
     }
 
@@ -696,19 +699,18 @@ transcribe_status build_host_decoder_weights(const ParakeetModel & model, HostDe
     for (int i = 0; i < hp.pred_n_layers; ++i) {
         const auto & lw = w.predictor.lstm[i];
         auto &       lh = out.predictor.lstm[i];
-        if (!read_tensor_to_f32(lw.Wx, lh.Wx)) {
-            return TRANSCRIBE_ERR_GGUF;
-        }
-        if (!read_tensor_to_f32(lw.Wh, lh.Wh)) {
-            return TRANSCRIBE_ERR_GGUF;
-        }
+        lh.src_Wx = lw.Wx;
+        lh.src_Wh = lw.Wh;
         if (!read_tensor_to_f32(lw.b, lh.b)) {
             return TRANSCRIBE_ERR_GGUF;
         }
 
-        const size_t gates    = static_cast<size_t>(4 * hp.pred_hidden);
-        const size_t mat_size = gates * static_cast<size_t>(hp.pred_hidden);
-        if (lh.Wx.size() != mat_size || lh.Wh.size() != mat_size) {
+        const size_t gates = static_cast<size_t>(4 * hp.pred_hidden);
+        auto         is_gate_matrix = [&](const ggml_tensor * t) {
+            return t != nullptr && t->ne[0] == hp.pred_hidden && static_cast<size_t>(t->ne[1]) == gates &&
+                   t->ne[2] == 1 && t->ne[3] == 1;
+        };
+        if (!is_gate_matrix(lh.src_Wx) || !is_gate_matrix(lh.src_Wh)) {
             log_msg(TRANSCRIBE_LOG_LEVEL_ERROR, "parakeet decoder: pred.lstm.%d Wx/Wh wrong size", i);
             return TRANSCRIBE_ERR_GGUF;
         }
@@ -732,17 +734,20 @@ transcribe_status build_host_decoder_weights(const ParakeetModel & model, HostDe
     out.joint.joint_n     = hp.joint_n_classes();
     out.joint.activation  = hp.joint_activation;
 
-    // enc/pred/out_b are mirrored to host fp32; out_w is NOT mirrored
-    // here (build_joint_weight dequantizes it from the model tensor).
+    // enc_w and the biases are mirrored to host fp32; pred_w and out_w
+    // are not (build_joint_weight copies them in their stored type).
     if (!read_tensor_to_f32(w.joint.enc_w, out.joint.enc_w)) {
         return TRANSCRIBE_ERR_GGUF;
     }
     if (!read_tensor_to_f32(w.joint.enc_b, out.joint.enc_b)) {
         return TRANSCRIBE_ERR_GGUF;
     }
-    if (!read_tensor_to_f32(w.joint.pred_w, out.joint.pred_w)) {
+    if (w.joint.pred_w == nullptr || w.joint.pred_w->ne[0] != hp.pred_hidden ||
+        w.joint.pred_w->ne[1] != hp.joint_hidden || w.joint.pred_w->ne[2] != 1 || w.joint.pred_w->ne[3] != 1) {
+        log_msg(TRANSCRIBE_LOG_LEVEL_ERROR, "parakeet decoder: joint pred_w wrong shape");
         return TRANSCRIBE_ERR_GGUF;
     }
+    out.joint.src_pred_w = w.joint.pred_w;
     if (!read_tensor_to_f32(w.joint.pred_b, out.joint.pred_b)) {
         return TRANSCRIBE_ERR_GGUF;
     }
@@ -750,7 +755,7 @@ transcribe_status build_host_decoder_weights(const ParakeetModel & model, HostDe
         return TRANSCRIBE_ERR_GGUF;
     }
 
-    // Make the joint weights resident as fp32 ggml tensors. Fatal: a
+    // Make the joint weights resident as ggml tensors. Fatal: a
     // failure means the model cannot decode — fail fast at load.
     if (w.joint.out_w == nullptr) {
         log_msg(TRANSCRIBE_LOG_LEVEL_ERROR, "parakeet decoder: joint out_w missing");
